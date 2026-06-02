@@ -12,7 +12,7 @@ app.use(cors({ origin: "*" }));
 app.use(express.json({ limit: "10mb" }));
 
 // Proxy Anthropic API calls
-app.post("/api/*path", async (req, res) => {
+app.post("/api/:path(*)", async (req, res) => {
   try {
     const path = req.params.path || "";
     const r = await fetch(`https://api.anthropic.com/${path}`, {
