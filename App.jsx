@@ -29,7 +29,7 @@ If clean, proceed with no filters.
 STEP 3 — FETCH DATA
 Call these three tools with the refined query (add near/not_near if refined):
 - v2_live_top_creators with keywords, languages=["en"], size=20
-- v2_live_top_sources with keywords, languages=["en"], size=20  
+- v2_live_top_sources with keywords, languages=["en"], size=20
 - v2_live_top_terms with keywords, languages=["en"], size=25
 
 STEP 4 — CHECK RESULTS & RETRY IF THIN
@@ -55,7 +55,6 @@ Return ONLY this exact JSON structure, nothing else:
 
 Critical: Return ONLY the JSON object. No markdown, no explanation, no preamble.`;
 
-// ── Tier classification ────────────────────────────────────────────────────────
 function classifyCreators(list) {
   const f = list.filter(c => c.creator?.trim());
   if (!f.length) return { mega: [], specialist: [], rising: [] };
@@ -80,10 +79,8 @@ function slugToName(s) {
   return s.replace(/_/g, " ").replace(/\b\w/g, l => l.toUpperCase());
 }
 
-// ── Main agent call ────────────────────────────────────────────────────────────
 async function runAgent(keyword, onStage) {
   onStage("Sampling mentions…");
-
   const res = await fetch("/api/v1/messages", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -98,36 +95,38 @@ async function runAgent(keyword, onStage) {
 
   const data = await res.json();
 
-  // Find the final text response
-  const textBlock = data.content?.filter(b => b.type === "text").pop();
-  if (!textBlock) throw new Error("No response from agent");
+  console.log("Raw response:", JSON.stringify(data).slice(0, 1000));
 
-  const text = textBlock.text.trim();
+  if (data.error) throw new Error(data.error.message || "API error");
 
-  // Parse JSON from response
+  // Claude may return tool_use blocks before the final text — find the last text block
+  const textBlocks = data.content?.filter(b => b.type === "text") || [];
+
+  if (textBlocks.length === 0) {
+    const types = data.content?.map(b => b.type).join(", ") || "none";
+    const stopReason = data.stop_reason || "unknown";
+    throw new Error(`Agent returned no text. Stop reason: ${stopReason}. Block types: ${types}`);
+  }
+
+  const text = textBlocks[textBlocks.length - 1].text.trim();
   const jsonMatch = text.match(/\{[\s\S]*\}/);
-  if (!jsonMatch) throw new Error("Could not parse agent response");
+
+  if (!jsonMatch) {
+    throw new Error(`Could not find JSON in response: ${text.slice(0, 300)}`);
+  }
 
   return JSON.parse(jsonMatch[0]);
 }
 
-// ── Sub-components ─────────────────────────────────────────────────────────────
 function Bar({ value, max }) {
   const pct = Math.max(3, Math.round((value / max) * 100));
-  return (
-    <div className="bar-track">
-      <div className="bar-fill" style={{ width: `${pct}%` }} />
-    </div>
-  );
+  return <div className="bar-track"><div className="bar-fill" style={{ width: `${pct}%` }} /></div>;
 }
 
 function CreatorRow({ creator, value, tier, max }) {
   return (
     <div className={`row-item tier-${tier}`}>
-      <div className="row-left">
-        <span className={`tier-dot dot-${tier}`} />
-        <span className="row-name">{creator}</span>
-      </div>
+      <div className="row-left"><span className={`tier-dot dot-${tier}`} /><span className="row-name">{creator}</span></div>
       <span className="row-count">{value}</span>
       <Bar value={value} max={max} />
     </div>
@@ -137,10 +136,7 @@ function CreatorRow({ creator, value, tier, max }) {
 function SourceRow({ slug, value, tier, max }) {
   return (
     <div className={`row-item tier-${tier}`}>
-      <div className="row-left">
-        <span className={`tier-dot dot-${tier}`} />
-        <span className="row-name">{slugToName(slug)}</span>
-      </div>
+      <div className="row-left"><span className={`tier-dot dot-${tier}`} /><span className="row-name">{slugToName(slug)}</span></div>
       <span className="row-count">{value}</span>
       <Bar value={value} max={max} />
     </div>
@@ -151,10 +147,7 @@ function InsightCard({ icon, title, body }) {
   return (
     <div className="insight-card">
       <span className="insight-icon">{icon}</span>
-      <div>
-        <div className="insight-title">{title}</div>
-        <div className="insight-body">{body}</div>
-      </div>
+      <div><div className="insight-title">{title}</div><div className="insight-body">{body}</div></div>
     </div>
   );
 }
@@ -176,7 +169,6 @@ function DisambigBanner({ result }) {
   );
 }
 
-// ── Main component ─────────────────────────────────────────────────────────────
 export default function App() {
   const [input, setInput] = useState("");
   const [keyword, setKeyword] = useState("");
@@ -190,30 +182,21 @@ export default function App() {
   async function run() {
     if (!input.trim() || loading) return;
     const kw = input.trim();
-    setKeyword(kw);
-    setLoading(true);
-    setError(null);
-    setResult(null);
-
+    setKeyword(kw); setLoading(true); setError(null); setResult(null);
     try {
-      const data = await runAgent(kw, setStage);
-      setResult(data);
+      setResult(await runAgent(kw, setStage));
       setTab("creators");
     } catch (e) {
       setError(e.message);
     } finally {
-      setLoading(false);
-      setStage("");
+      setLoading(false); setStage("");
     }
   }
 
+  const stop = new Set(["the","and","for","that","this","with","are","was","its","use","may","have","from","they","but","not","all","also","more","about","into","will","some","than","when","there","been","other","what","which","their","has"]);
   const creators = result?.creators || [];
   const sources = result?.sources || [];
-  const terms = (result?.terms || []).filter(t => {
-    const stop = new Set(["the","and","for","that","this","with","are","was","its","use","may","have","from","they","but","not","all","also","more","about","into","will","some","than","when","there","been","other","what","which","their","has"]);
-    return !stop.has(t.term) && t.term !== keyword.toLowerCase();
-  });
-
+  const terms = (result?.terms || []).filter(t => !stop.has(t.term) && t.term !== keyword.toLowerCase());
   const ct = classifyCreators(creators);
   const st = classifySources(sources);
   const cMax = Math.max(...creators.map(c => c.value), 1);
@@ -221,9 +204,7 @@ export default function App() {
 
   return (
     <div className="root">
-      <div className="blob blob-1" />
-      <div className="blob blob-2" />
-
+      <div className="blob blob-1" /><div className="blob blob-2" />
       <div className="shell">
         <header className="header">
           <div className="overline">All Ears · Influence Intelligence</div>
@@ -232,14 +213,10 @@ export default function App() {
         </header>
 
         <div className="search-block">
-          <input
-            ref={inputRef}
-            className="search-input"
-            value={input}
+          <input ref={inputRef} className="search-input" value={input}
             onChange={e => setInput(e.target.value)}
             onKeyDown={e => e.key === "Enter" && run()}
-            placeholder="e.g. Puma, Ozempic, electric vehicles…"
-          />
+            placeholder="e.g. Puma, Ozempic, electric vehicles…" />
           <button className="search-btn" onClick={run} disabled={loading || !input.trim()}>
             {loading ? <span className="spinner" /> : "Build Map"}
           </button>
@@ -292,34 +269,38 @@ export default function App() {
 
             {tab === "creators" && (
               <div className="list-section">
-                {[["mega",ct.mega,"Mega Voices"],["specialist",ct.specialist,"Specialists"],["rising",ct.rising,"Rising Voices"]].filter(([,items]) => items.length).map(([tier, items, label]) => (
-                  <div key={tier} className="tier-group">
-                    <div className="tier-label">
-                      <span className={`tier-dot dot-${tier}`} />
-                      {label} <span className="tier-count">({items.length})</span>
+                {[["mega",ct.mega,"Mega Voices"],["specialist",ct.specialist,"Specialists"],["rising",ct.rising,"Rising Voices"]]
+                  .filter(([,i]) => i.length)
+                  .map(([tier,items,label]) => (
+                    <div key={tier} className="tier-group">
+                      <div className="tier-label">
+                        <span className={`tier-dot dot-${tier}`} />
+                        {label} <span className="tier-count">({items.length})</span>
+                      </div>
+                      <div className="rows">
+                        {items.map((c,i) => <CreatorRow key={i} creator={c.creator} value={c.value} tier={tier} max={cMax} />)}
+                      </div>
                     </div>
-                    <div className="rows">
-                      {items.map((c, i) => <CreatorRow key={i} creator={c.creator} value={c.value} tier={tier} max={cMax} />)}
-                    </div>
-                  </div>
-                ))}
+                  ))}
                 {creators.length === 0 && <p className="empty-msg">No creators found.</p>}
               </div>
             )}
 
             {tab === "channels" && (
               <div className="list-section">
-                {[["dominant",st.dominant,"Dominant Channels"],["regular",st.regular,"Regular Channels"],["niche",st.niche,"Niche Channels"]].filter(([,items]) => items.length).map(([tier, items, label]) => (
-                  <div key={tier} className="tier-group">
-                    <div className="tier-label">
-                      <span className={`tier-dot dot-${tier}`} />
-                      {label} <span className="tier-count">({items.length})</span>
+                {[["dominant",st.dominant,"Dominant Channels"],["regular",st.regular,"Regular Channels"],["niche",st.niche,"Niche Channels"]]
+                  .filter(([,i]) => i.length)
+                  .map(([tier,items,label]) => (
+                    <div key={tier} className="tier-group">
+                      <div className="tier-label">
+                        <span className={`tier-dot dot-${tier}`} />
+                        {label} <span className="tier-count">({items.length})</span>
+                      </div>
+                      <div className="rows">
+                        {items.map((s,i) => <SourceRow key={i} slug={s.channel_name_slug} value={s.value} tier={tier} max={sMax} />)}
+                      </div>
                     </div>
-                    <div className="rows">
-                      {items.map((s, i) => <SourceRow key={i} slug={s.channel_name_slug} value={s.value} tier={tier} max={sMax} />)}
-                    </div>
-                  </div>
-                ))}
+                  ))}
                 {sources.length === 0 && <p className="empty-msg">No channels found.</p>}
               </div>
             )}
@@ -330,12 +311,13 @@ export default function App() {
                   <>
                     <div className="section-label">Co-occurring terms · opacity = statistical significance</div>
                     <div className="terms-cloud">
-                      {terms.map((t, i) => {
-                        const op = Math.max(0.3, Math.min(1, t.score / 300));
-                        return <span key={i} className="term-pill" style={{ opacity: op }}>{t.term}</span>;
-                      })}
+                      {terms.map((t,i) => (
+                        <span key={i} className="term-pill" style={{ opacity: Math.max(0.3, Math.min(1, t.score/300)) }}>
+                          {t.term}
+                        </span>
+                      ))}
                     </div>
-                    <p className="terms-note">Terms appearing distinctively alongside "{keyword}" — weighted by statistical co-occurrence.</p>
+                    <p className="terms-note">Terms appearing distinctively alongside "{keyword}".</p>
                   </>
                 ) : (
                   <div className="empty-themes">
