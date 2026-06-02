@@ -48,7 +48,7 @@ async function callAllEars(prompt) {
     body: JSON.stringify({
       model: "claude-sonnet-4-5",
       max_tokens: 1000,
-      mcp_servers: [{ type: "url", url: MCP_URL, name: "allears", "x-api-key": ALL_EARS_KEY }],
+      mcp_servers: [{ type: "url", url: MCP_URL, name: "allears", headers: { "x-api-key": ALL_EARS_KEY } }],
       messages: [{ role: "user", content: prompt }],
     }),
   });
