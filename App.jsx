@@ -1,60 +1,5 @@
 import { useState, useRef } from "react";
 
-const ALL_EARS_KEY = "0e102db05004cd002185bae2f54d5fb60014ab99";
-const MCP_URL = "https://mcp.allears.ai";
-
-const SYSTEM_PROMPT = `You are a media intelligence analyst with access to the All Ears spoken media database via MCP tools.
-
-When given a brand or keyword, follow this exact process:
-
-STEP 1 — SAMPLE & CHECK FOR NOISE
-Call v2_live_get_mentions with:
-- keywords: [the keyword]
-- languages: ["en"]
-- page_size: 12
-- max_mentions: 2
-- snippet_size: 200
-- include_related: false
-
-Read the snippets carefully. Is this predominantly about the intended brand/topic? Watch for:
-- Non-English words dominating
-- Famous people/animals/places with the same name
-- Common everyday words unrelated to any brand
-Well-known brands like Adidas, Nike, Apple, Puma (sportswear) should rarely need filtering.
-
-STEP 2 — REFINE IF NEEDED
-If noisy, generate near_keywords (max 8) and not_near_keywords (max 5) to anchor the search.
-If clean, proceed with no filters.
-
-STEP 3 — FETCH DATA
-Call these three tools with the refined query (add near/not_near if refined):
-- v2_live_top_creators with keywords, languages=["en"], size=20
-- v2_live_top_sources with keywords, languages=["en"], size=20
-- v2_live_top_terms with keywords, languages=["en"], size=25
-
-STEP 4 — CHECK RESULTS & RETRY IF THIN
-If creators list has fewer than 5 results, your filters are too tight.
-Remove the near_keywords/not_near_keywords and retry all three calls without filters.
-
-STEP 5 — GENERATE INSIGHTS
-Based on the creators, sources, and terms you found, generate 3 strategic insights.
-
-STEP 6 — RETURN STRUCTURED JSON
-Return ONLY this exact JSON structure, nothing else:
-{
-  "refined": true/false,
-  "explanation": "one sentence about what noise was found, or null if clean",
-  "nearKeywords": ["word1"] or [],
-  "notNearKeywords": ["word1"] or [],
-  "episodeCount": number or null,
-  "creators": [{"creator": "name", "value": number}, ...],
-  "sources": [{"channel_name_slug": "slug", "value": number}, ...],
-  "terms": [{"term": "word", "score": number}, ...],
-  "insights": [{"icon": "emoji", "title": "5 words max", "body": "2 sentences actionable"}, ...]
-}
-
-Critical: Return ONLY the JSON object. No markdown, no explanation, no preamble.`;
-
 function classifyCreators(list) {
   const f = list.filter(c => c.creator?.trim());
   if (!f.length) return { mega: [], specialist: [], rising: [] };
@@ -80,42 +25,15 @@ function slugToName(s) {
 }
 
 async function runAgent(keyword, onStage) {
-  onStage("Sampling mentions…");
-  const res = await fetch("/api/v1/messages", {
+  onStage("Running agent…");
+  const res = await fetch("/agent", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: "claude-sonnet-4-5",
-      max_tokens: 4000,
-      system: SYSTEM_PROMPT,
-      messages: [{ role: "user", content: `Build an influence map for: "${keyword}"` }],
-      mcp_servers: [{ type: "url", url: MCP_URL, name: "allears", headers: { "x-api-key": ALL_EARS_KEY } }],
-    }),
+    body: JSON.stringify({ keyword }),
   });
-
   const data = await res.json();
-
-  console.log("Raw response:", JSON.stringify(data).slice(0, 1000));
-
-  if (data.error) throw new Error(data.error.message || "API error");
-
-  // Claude may return tool_use blocks before the final text — find the last text block
-  const textBlocks = data.content?.filter(b => b.type === "text") || [];
-
-  if (textBlocks.length === 0) {
-    const types = data.content?.map(b => b.type).join(", ") || "none";
-    const stopReason = data.stop_reason || "unknown";
-    throw new Error(`Agent returned no text. Stop reason: ${stopReason}. Block types: ${types}`);
-  }
-
-  const text = textBlocks[textBlocks.length - 1].text.trim();
-  const jsonMatch = text.match(/\{[\s\S]*\}/);
-
-  if (!jsonMatch) {
-    throw new Error(`Could not find JSON in response: ${text.slice(0, 300)}`);
-  }
-
-  return JSON.parse(jsonMatch[0]);
+  if (data.error) throw new Error(data.error);
+  return data;
 }
 
 function Bar({ value, max }) {
