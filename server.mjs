@@ -55,9 +55,8 @@ Return ONLY this JSON (no markdown, no preamble):
       }],
       mcp_servers: [{
         type: "url",
-        url: "https://mcp.allears.ai/",
+        url: "https://mcp.allears.ai/?api_key=0e102db05004cd002185bae2f54d5fb60014ab99",
         name: "all-ears",
-        authorization_token: "0e102db05004cd002185bae2f54d5fb60014ab99",
       }],
       tools: [{
         type: "mcp_toolset",
