@@ -14,8 +14,12 @@ app.use(express.json({ limit: "10mb" }));
 const ALL_EARS_KEY = process.env.ALL_EARS_API_KEY || "0e102db05004cd002185bae2f54d5fb60014ab99";
 const ALL_EARS_BASE = "https://api.allears.ai";
 
+// ── Date helpers ──────────────────────────────────────────────────────────────
+const today = () => new Date().toISOString().split("T")[0];
+const daysAgo = (n) => new Date(Date.now() - n * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
+
 // ── Call All Ears REST API ────────────────────────────────────────────────────
-async function callAllEarsREST(endpoint, params) {
+async function callAllEars(endpoint, params) {
   const url = new URL(`${ALL_EARS_BASE}${endpoint}`);
   Object.entries(params).forEach(([k, v]) => {
     if (v !== undefined && v !== null) {
@@ -29,29 +33,18 @@ async function callAllEarsREST(endpoint, params) {
       "Accept": "application/json",
     },
   });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`All Ears API error ${res.status}: ${text.slice(0, 200)}`);
+  }
   return res.json();
 }
 
 // ── Tool definitions for Claude ───────────────────────────────────────────────
 const TOOLS = [
   {
-    name: "get_mentions",
-    description: "Sample raw mentions for a keyword to check for noise and relevance. Returns snippets of actual spoken content.",
-    input_schema: {
-      type: "object",
-      properties: {
-        keyword: { type: "string", description: "The brand or topic to search for" },
-        languages: { type: "array", items: { type: "string" }, description: "Language codes e.g. ['en']" },
-        near_keywords: { type: "array", items: { type: "string" }, description: "Words that must appear nearby" },
-        not_near_keywords: { type: "array", items: { type: "string" }, description: "Words that must NOT appear nearby" },
-        page_size: { type: "number", description: "Number of results (max 100)" },
-      },
-      required: ["keyword"],
-    },
-  },
-  {
-    name: "get_top_creators",
-    description: "Get top podcast/YouTube/TikTok creators talking about a keyword, ranked by episode count.",
+    name: "sample_mentions",
+    description: "Sample 20 raw mention snippets for a keyword to check for noise and relevance. Use this first to decide if the keyword needs filtering.",
     input_schema: {
       type: "object",
       properties: {
@@ -65,7 +58,7 @@ const TOOLS = [
   },
   {
     name: "get_top_sources",
-    description: "Get top channels/shows talking about a keyword, ranked by episode count.",
+    description: "Get top channels/shows talking about a keyword using the v2 aggregation endpoint. Returns up to 50 channels ranked by episode count across the full archive.",
     input_schema: {
       type: "object",
       properties: {
@@ -73,13 +66,14 @@ const TOOLS = [
         languages: { type: "array", items: { type: "string" } },
         near_keywords: { type: "array", items: { type: "string" } },
         not_near_keywords: { type: "array", items: { type: "string" } },
+        size: { type: "number", description: "Number of results, max 100" },
       },
       required: ["keyword"],
     },
   },
   {
     name: "get_top_terms",
-    description: "Get terms that co-occur most distinctively with a keyword in spoken media.",
+    description: "Get terms that co-occur most distinctively with a keyword using the v2 aggregation endpoint. Returns statistically significant co-occurring terms from the full archive.",
     input_schema: {
       type: "object",
       properties: {
@@ -87,6 +81,7 @@ const TOOLS = [
         languages: { type: "array", items: { type: "string" } },
         near_keywords: { type: "array", items: { type: "string" } },
         not_near_keywords: { type: "array", items: { type: "string" } },
+        size: { type: "number", description: "Number of terms, max 100" },
       },
       required: ["keyword"],
     },
@@ -95,108 +90,140 @@ const TOOLS = [
 
 // ── Execute tool calls ────────────────────────────────────────────────────────
 async function executeTool(name, input) {
-  const params = {
+  const base = {
     search_term: input.keyword,
     languages: input.languages || ["en"],
-    start_date: new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString().split("T")[0],
-    end_date: new Date().toISOString().split("T")[0],
+    start_date: daysAgo(365),
+    end_date: today(),
   };
-  if (input.near_keywords?.length) params.near_keywords = input.near_keywords;
-  if (input.not_near_keywords?.length) params.not_near_keywords = input.not_near_keywords;
+  if (input.near_keywords?.length) base.near_keywords = input.near_keywords;
+  if (input.not_near_keywords?.length) base.not_near_keywords = input.not_near_keywords;
 
-  if (name === "get_mentions") {
-    params.page_size = input.page_size || 15;
-    const data = await callAllEarsREST("/search/v1/", params);
-    // Return simplified snippets
+  // ── Sample raw mentions for noise detection ──────────────────────────────
+  if (name === "sample_mentions") {
+    const data = await callAllEars("/search/v1/", { ...base, page_size: 20 });
     const results = (data.results || []).map(r => ({
       channel: r.channel?.name,
       channel_type: r.channel?.channel_type,
-      text: r.snippets?.[0]?.text || r.text,
+      text: r.snippets?.[0]?.text || r.text || "",
     }));
-    return { results, count: data.count };
+    return { results, total: data.count };
   }
 
-  if (name === "get_top_creators" || name === "get_top_sources" || name === "get_top_terms") {
-    // Fetch 100 results and aggregate
-    params.page_size = 100;
-    const data = await callAllEarsREST("/search/v1/", params);
-    const results = data.results || [];
+  // ── Top sources via v2 aggregation ───────────────────────────────────────
+  if (name === "get_top_sources") {
+    const params = {
+      ...base,
+      size: input.size || 50,
+    };
+    // v2 live top sources endpoint
+    const data = await callAllEars("/v2/live/top-sources/", params);
 
-    if (name === "get_top_creators") {
+    // Normalise: API may return { results: [...] } or { sources: [...] } or array
+    const raw = data.results || data.sources || data.channels || (Array.isArray(data) ? data : []);
+
+    const sources = raw.slice(0, 50).map(s => ({
+      channel_name_slug: (s.channel_name || s.name || s.channel || "unknown")
+        .toLowerCase().replace(/\s+/g, "_"),
+      channel_name: s.channel_name || s.name || s.channel || "Unknown",
+      channel_type: s.channel_type || s.type || null,
+      value: s.value || s.count || s.episode_count || 0,
+    }));
+
+    // Fallback: if v2 endpoint returned nothing, aggregate from search
+    if (!sources.length) {
+      const fallback = await callAllEars("/search/v1/", { ...base, page_size: 100 });
       const counts = {};
-      results.forEach(r => {
-        const creator = r.channel?.name;
-        if (creator) counts[creator] = (counts[creator] || 0) + 1;
+      (fallback.results || []).forEach(r => {
+        const n = r.channel?.name;
+        if (n) counts[n] = (counts[n] || 0) + 1;
       });
-      const creators = Object.entries(counts)
-        .sort((a, b) => b[1] - a[1])
-        .slice(0, 20)
-        .map(([creator, value]) => ({ creator, value }));
-      return { creators };
+      return {
+        sources: Object.entries(counts)
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 50)
+          .map(([name, value]) => ({
+            channel_name_slug: name.toLowerCase().replace(/\s+/g, "_"),
+            channel_name: name,
+            value,
+          })),
+        fallback: true,
+      };
     }
 
-    if (name === "get_top_sources") {
-      const counts = {};
-      const slugs = {};
-      results.forEach(r => {
-        const name = r.channel?.name;
-        const slug = r.channel?.name?.toLowerCase().replace(/\s+/g, "_") || name;
-        if (name) {
-          counts[name] = (counts[name] || 0) + 1;
-          slugs[name] = slug;
-        }
-      });
-      const sources = Object.entries(counts)
-        .sort((a, b) => b[1] - a[1])
-        .slice(0, 20)
-        .map(([name, value]) => ({ channel_name_slug: slugs[name], value }));
-      return { sources };
-    }
+    return { sources };
+  }
 
-    if (name === "get_top_terms") {
-      // Extract words from snippets and count frequency
+  // ── Top terms via v2 aggregation ─────────────────────────────────────────
+  if (name === "get_top_terms") {
+    const params = {
+      ...base,
+      size: input.size || 50,
+    };
+    // v2 live top terms endpoint
+    const data = await callAllEars("/v2/live/top-terms/", params);
+
+    // Normalise
+    const raw = data.results || data.terms || (Array.isArray(data) ? data : []);
+
+    const terms = raw.slice(0, 50).map(t => ({
+      term: t.term || t.word || t.key || "",
+      score: t.score || t.count || t.doc_count || 0,
+    })).filter(t => t.term);
+
+    // Fallback: extract from snippets if v2 returned nothing
+    if (!terms.length) {
+      const fallback = await callAllEars("/search/v1/", { ...base, page_size: 100 });
+      const stopWords = new Set(["the","and","for","that","this","with","are","was","its","use","may","have","from","they","but","not","all","also","more","about","into","will","some","than","when","there","been","other","what","which","their","has","our","we","it","is","in","of","to","a","an","i","you","he","she","they","we","be","do","so","if","at","by","or","as","on","up","just","like","very","really","would","could","should"]);
       const wordCounts = {};
-      const stopWords = new Set(["the","and","for","that","this","with","are","was","its","use","may","have","from","they","but","not","all","also","more","about","into","will","some","than","when","there","been","other","what","which","their","has","our","we","it","is","in","of","to","a","an","i","you","he","she","they","we","be","do","so","if","at","by","or","as","on","up"]);
-      results.forEach(r => {
+      (fallback.results || []).forEach(r => {
         const text = (r.snippets?.[0]?.text || r.text || "").toLowerCase().replace(/<[^>]+>/g, "");
-        const words = text.match(/\b[a-z]{4,}\b/g) || [];
-        words.forEach(w => {
+        (text.match(/\b[a-z]{4,}\b/g) || []).forEach(w => {
           if (!stopWords.has(w) && w !== input.keyword.toLowerCase()) {
             wordCounts[w] = (wordCounts[w] || 0) + 1;
           }
         });
       });
-      const terms = Object.entries(wordCounts)
-        .sort((a, b) => b[1] - a[1])
-        .slice(0, 25)
-        .map(([term, count]) => ({ term, score: count * 10 }));
-      return { terms };
+      return {
+        terms: Object.entries(wordCounts)
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 50)
+          .map(([term, count]) => ({ term, score: count * 10 })),
+        fallback: true,
+      };
     }
+
+    return { terms };
   }
 }
 
-// ── Agent loop ────────────────────────────────────────────────────────────────
+// ── Agent system prompt ───────────────────────────────────────────────────────
 const SYSTEM_PROMPT = `You are a media intelligence analyst. Use the provided tools to build an influence map for any brand or keyword.
 
-Follow this process:
-1. Call get_mentions to sample 15 raw results and check for noise (homonyms, non-English words, unrelated meanings)
-2. If noisy, add near_keywords to anchor to the right context. If clean, proceed without filters.
-3. Call get_top_creators, get_top_sources, and get_top_terms with the refined query
-4. If fewer than 5 creators returned, remove the filters and retry
-5. Generate 3 strategic insights from what you found
+Follow this exact process:
+1. Call sample_mentions to get 20 raw snippets. Check if results are noisy (wrong meaning, wrong language, homonyms).
+2. If noisy: add near_keywords to anchor context. If clean: proceed without filters.
+3. Call get_top_sources with size=50 to get channels ranked by episode count.
+4. Call get_top_terms with size=50 to get co-occurring terms.
+5. If get_top_sources returns fewer than 5 results, retry without near/not_near filters.
+6. Generate 3 strategic insights based on what you found — be specific, reference actual channel names or patterns you observed.
 
-When done, return ONLY this JSON (no markdown, no preamble):
+Return ONLY this JSON when done (no markdown fences, no preamble):
 {
   "refined": true/false,
-  "explanation": "what noise was found, or null",
+  "explanation": "what noise was found and how you filtered it, or null if clean",
   "nearKeywords": [],
   "notNearKeywords": [],
-  "creators": [{"creator": "name", "value": number}],
+  "episodeCount": number or null,
+  "creators": [],
   "sources": [{"channel_name_slug": "slug", "value": number}],
   "terms": [{"term": "word", "score": number}],
-  "insights": [{"icon": "emoji", "title": "5 words max", "body": "2 sentences"}]
-}`;
+  "insights": [{"icon": "emoji", "title": "5 words max", "body": "2 specific sentences referencing actual data"}]
+}
 
+Note: creators and sources come from the same get_top_sources call. Map the results to both fields identically so the UI can display them.`;
+
+// ── Agent loop ────────────────────────────────────────────────────────────────
 async function runAgentLoop(keyword) {
   const messages = [{ role: "user", content: `Build an influence map for: "${keyword}"` }];
 
@@ -222,15 +249,13 @@ async function runAgentLoop(keyword) {
 
     messages.push({ role: "assistant", content: data.content });
 
-    // If done, extract final JSON
     if (data.stop_reason === "end_turn") {
       const text = data.content.filter(b => b.type === "text").pop()?.text || "";
       const match = text.match(/\{[\s\S]*\}/);
-      if (!match) throw new Error(`No JSON in final response: ${text.slice(0, 200)}`);
+      if (!match) throw new Error(`No JSON in final response: ${text.slice(0, 300)}`);
       return JSON.parse(match[0]);
     }
 
-    // Execute tool calls
     if (data.stop_reason === "tool_use") {
       const toolResults = [];
       for (const block of data.content) {
@@ -266,6 +291,7 @@ app.post("/agent", async (req, res) => {
     const result = await runAgentLoop(keyword);
     res.json(result);
   } catch (e) {
+    console.error("Agent error:", e);
     res.status(500).json({ error: e.message });
   }
 });
