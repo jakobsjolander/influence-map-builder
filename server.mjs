@@ -58,7 +58,7 @@ const TOOLS = [
   },
   {
     name: "get_top_sources",
-    description: "Get top channels/shows talking about a keyword using the v2 aggregation endpoint. Returns up to 50 channels ranked by episode count across the full archive.",
+    description: "Get top channels/shows talking about a keyword. Returns up to 50 channels ranked by episode count via the MCP aggregation layer.",
     input_schema: {
       type: "object",
       properties: {
@@ -66,14 +66,13 @@ const TOOLS = [
         languages: { type: "array", items: { type: "string" } },
         near_keywords: { type: "array", items: { type: "string" } },
         not_near_keywords: { type: "array", items: { type: "string" } },
-        size: { type: "number", description: "Number of results, max 100" },
       },
       required: ["keyword"],
     },
   },
   {
     name: "get_top_terms",
-    description: "Get terms that co-occur most distinctively with a keyword using the v2 aggregation endpoint. Returns statistically significant co-occurring terms from the full archive.",
+    description: "Get terms that co-occur most distinctively with a keyword. Returns statistically significant co-occurring terms via the MCP aggregation layer.",
     input_schema: {
       type: "object",
       properties: {
@@ -81,7 +80,6 @@ const TOOLS = [
         languages: { type: "array", items: { type: "string" } },
         near_keywords: { type: "array", items: { type: "string" } },
         not_near_keywords: { type: "array", items: { type: "string" } },
-        size: { type: "number", description: "Number of terms, max 100" },
       },
       required: ["keyword"],
     },
@@ -93,107 +91,43 @@ async function executeTool(name, input) {
   const base = {
     search_term: input.keyword,
     languages: input.languages || ["en"],
-    start_date: daysAgo(365),
+    start_date: daysAgo(90),
     end_date: today(),
   };
   if (input.near_keywords?.length) base.near_keywords = input.near_keywords;
   if (input.not_near_keywords?.length) base.not_near_keywords = input.not_near_keywords;
 
-  // ── Sample raw mentions for noise detection ──────────────────────────────
+  // ── Sample raw mentions for noise detection (direct REST) ────────────────
   if (name === "sample_mentions") {
     const data = await callAllEars("/search/v1/", { ...base, page_size: 20 });
-    const results = (data.results || []).map(r => ({
-      channel: r.channel?.name,
-      channel_type: r.channel?.channel_type,
-      text: r.snippets?.[0]?.text || r.text || "",
-    }));
-    return { results, total: data.count };
+    return {
+      results: (data.results || []).map(r => ({
+        channel: r.channel?.name,
+        channel_type: r.channel?.channel_type,
+        text: r.snippets?.[0]?.text || r.text || "",
+      })),
+      total: data.count,
+    };
   }
 
-  // ── Top sources via v2 aggregation ───────────────────────────────────────
-  if (name === "get_top_sources") {
-    const params = {
-      ...base,
-      size: input.size || 50,
-    };
-    // v2 live top sources endpoint
-    const data = await callAllEars("/v2/live/top-sources/", params);
-
-    // Normalise: API may return { results: [...] } or { sources: [...] } or array
-    const raw = data.results || data.sources || data.channels || (Array.isArray(data) ? data : []);
-
-    const sources = raw.slice(0, 50).map(s => ({
-      channel_name_slug: (s.channel_name || s.name || s.channel || "unknown")
-        .toLowerCase().replace(/\s+/g, "_"),
-      channel_name: s.channel_name || s.name || s.channel || "Unknown",
-      channel_type: s.channel_type || s.type || null,
-      value: s.value || s.count || s.episode_count || 0,
-    }));
-
-    // Fallback: if v2 endpoint returned nothing, aggregate from search
-    if (!sources.length) {
-      const fallback = await callAllEars("/search/v1/", { ...base, page_size: 100 });
-      const counts = {};
-      (fallback.results || []).forEach(r => {
-        const n = r.channel?.name;
-        if (n) counts[n] = (counts[n] || 0) + 1;
-      });
-      return {
-        sources: Object.entries(counts)
-          .sort((a, b) => b[1] - a[1])
-          .slice(0, 50)
-          .map(([name, value]) => ({
-            channel_name_slug: name.toLowerCase().replace(/\s+/g, "_"),
-            channel_name: name,
-            value,
-          })),
-        fallback: true,
-      };
+  // ── Top sources + terms via n8n → All Ears MCP ──────────────────────────
+  if (name === "get_top_sources" || name === "get_top_terms") {
+    const n8nRes = await fetch("https://jakosjol.app.n8n.cloud/webhook/influence-map", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        keyword: input.keyword,
+        near_keywords: input.near_keywords || [],
+        not_near_keywords: input.not_near_keywords || [],
+        languages: input.languages || ["en"],
+      }),
+    });
+    if (!n8nRes.ok) {
+      throw new Error(`n8n webhook error ${n8nRes.status}`);
     }
-
-    return { sources };
-  }
-
-  // ── Top terms via v2 aggregation ─────────────────────────────────────────
-  if (name === "get_top_terms") {
-    const params = {
-      ...base,
-      size: input.size || 50,
-    };
-    // v2 live top terms endpoint
-    const data = await callAllEars("/v2/live/top-terms/", params);
-
-    // Normalise
-    const raw = data.results || data.terms || (Array.isArray(data) ? data : []);
-
-    const terms = raw.slice(0, 50).map(t => ({
-      term: t.term || t.word || t.key || "",
-      score: t.score || t.count || t.doc_count || 0,
-    })).filter(t => t.term);
-
-    // Fallback: extract from snippets if v2 returned nothing
-    if (!terms.length) {
-      const fallback = await callAllEars("/search/v1/", { ...base, page_size: 100 });
-      const stopWords = new Set(["the","and","for","that","this","with","are","was","its","use","may","have","from","they","but","not","all","also","more","about","into","will","some","than","when","there","been","other","what","which","their","has","our","we","it","is","in","of","to","a","an","i","you","he","she","they","we","be","do","so","if","at","by","or","as","on","up","just","like","very","really","would","could","should"]);
-      const wordCounts = {};
-      (fallback.results || []).forEach(r => {
-        const text = (r.snippets?.[0]?.text || r.text || "").toLowerCase().replace(/<[^>]+>/g, "");
-        (text.match(/\b[a-z]{4,}\b/g) || []).forEach(w => {
-          if (!stopWords.has(w) && w !== input.keyword.toLowerCase()) {
-            wordCounts[w] = (wordCounts[w] || 0) + 1;
-          }
-        });
-      });
-      return {
-        terms: Object.entries(wordCounts)
-          .sort((a, b) => b[1] - a[1])
-          .slice(0, 50)
-          .map(([term, count]) => ({ term, score: count * 10 })),
-        fallback: true,
-      };
-    }
-
-    return { terms };
+    const n8nData = await n8nRes.json();
+    if (name === "get_top_sources") return { sources: n8nData.sources || [] };
+    if (name === "get_top_terms") return { terms: n8nData.terms || [] };
   }
 }
 
@@ -203,10 +137,10 @@ const SYSTEM_PROMPT = `You are a media intelligence analyst. Use the provided to
 Follow this exact process:
 1. Call sample_mentions to get 20 raw snippets. Check if results are noisy (wrong meaning, wrong language, homonyms).
 2. If noisy: add near_keywords to anchor context. If clean: proceed without filters.
-3. Call get_top_sources with size=50 to get channels ranked by episode count.
-4. Call get_top_terms with size=50 to get co-occurring terms.
+3. Call get_top_sources with the refined query to get channels ranked by episode count.
+4. Call get_top_terms with the same query to get co-occurring terms.
 5. If get_top_sources returns fewer than 5 results, retry without near/not_near filters.
-6. Generate 3 strategic insights based on what you found — be specific, reference actual channel names or patterns you observed.
+6. Generate 3 strategic insights — be specific, reference actual channel names or patterns you observed.
 
 Return ONLY this JSON when done (no markdown fences, no preamble):
 {
